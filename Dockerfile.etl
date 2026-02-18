@@ -1,0 +1,53 @@
+FROM python:3.12-slim
+
+LABEL maintainer="Pharma DR Data Team"
+LABEL description="ETL Worker for Pharma DR Reporting Platform"
+
+# Install system dependencies (ODBC for SQL Server, curl for health checks)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    curl \
+    unixodbc-dev \
+    unixodbc \
+    gnupg2 \
+    apt-transport-https \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Microsoft ODBC Driver 18 for SQL Server
+RUN curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+       > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y msodbcsql18 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy and install Python requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy project
+COPY etl/ ./etl/
+COPY data/ ./data/
+COPY scripts/init_db.py ./scripts/init_db.py
+
+# Create data directories
+RUN mkdir -p \
+    /app/data/logs \
+    /app/data/watermarks \
+    /app/data/excel_samples \
+    /app/data/excel_processed \
+    /app/data/excel_rejected \
+    /app/data/synthetic
+
+# Non-root user
+RUN useradd -m etluser && chown -R etluser:etluser /app
+USER etluser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "from etl.config.settings import settings; print('OK')"
+
+CMD ["python", "etl/orchestration/scheduler.py"]

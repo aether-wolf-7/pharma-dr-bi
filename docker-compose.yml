@@ -1,0 +1,270 @@
+version: "3.9"
+
+# ============================================================
+# Pharma DR · Docker Compose Stack
+# Services: PostgreSQL, Redis, PgBouncer, Apache Superset, ETL Worker, Nginx
+# ============================================================
+
+x-common-env: &common-env
+  TZ: America/Santo_Domingo
+
+networks:
+  pharma-internal:
+    driver: bridge
+  pharma-public:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  superset-home:
+    driver: local
+  etl-data:
+    driver: local
+  nginx-certs:
+    driver: local
+
+services:
+
+  # ──────────────────────────────────────────────────────────
+  # PostgreSQL 16 — Data Warehouse
+  # ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pharma_postgres
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      POSTGRES_DB: ${POSTGRES_DB:-pharma_dr}
+      POSTGRES_USER: ${POSTGRES_USER:-pharma_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=es_DO.UTF-8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    networks:
+      - pharma-internal
+    ports:
+      - "127.0.0.1:5432:5432"   # localhost only — exposed via PgBouncer
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pharma_admin} -d ${POSTGRES_DB:-pharma_dr}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+        -c shared_buffers=2GB
+        -c effective_cache_size=6GB
+        -c maintenance_work_mem=512MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=64MB
+        -c default_statistics_target=100
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c work_mem=32MB
+        -c min_wal_size=1GB
+        -c max_wal_size=4GB
+        -c max_connections=200
+        -c log_min_duration_statement=1000
+
+  # ──────────────────────────────────────────────────────────
+  # PgBouncer — Connection Pooler
+  # ──────────────────────────────────────────────────────────
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pharma_pgbouncer
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-pharma_dr}
+      DB_USER: ${POSTGRES_USER:-pharma_admin}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-200}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_POOL_SIZE:-20}
+      AUTH_TYPE: scram-sha-256
+    networks:
+      - pharma-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ──────────────────────────────────────────────────────────
+  # Redis 7 — Superset Cache + Celery Broker
+  # ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pharma_redis
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD}
+        --maxmemory 1gb
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+    volumes:
+      - redis-data:/data
+    networks:
+      - pharma-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────
+  # Apache Superset 4.x — BI Layer
+  # ──────────────────────────────────────────────────────────
+  superset:
+    image: apache/superset:4.1.1
+    container_name: pharma_superset
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+      SUPERSET_WEBSERVER_PORT: 8088
+      SUPERSET_LOAD_EXAMPLES: "no"
+      PYTHONPATH: /app/pythonpath
+    volumes:
+      - superset-home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    networks:
+      - pharma-internal
+      - pharma-public
+    ports:
+      - "8088:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────
+  # Superset Celery Worker — Async Queries + Cache Warming
+  # ──────────────────────────────────────────────────────────
+  superset-worker:
+    image: apache/superset:4.1.1
+    container_name: pharma_superset_worker
+    restart: unless-stopped
+    command: celery --app=superset.tasks.celery_app:app worker --loglevel=info -c 2
+    environment:
+      <<: *common-env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+      PYTHONPATH: /app/pythonpath
+    volumes:
+      - superset-home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    networks:
+      - pharma-internal
+    depends_on:
+      - superset
+
+  # ──────────────────────────────────────────────────────────
+  # Superset Celery Beat — Scheduled Tasks (cache warm, alerts)
+  # ──────────────────────────────────────────────────────────
+  superset-beat:
+    image: apache/superset:4.1.1
+    container_name: pharma_superset_beat
+    restart: unless-stopped
+    command: celery --app=superset.tasks.celery_app:app beat --loglevel=info
+    environment:
+      <<: *common-env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+      PYTHONPATH: /app/pythonpath
+    volumes:
+      - superset-home:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    networks:
+      - pharma-internal
+    depends_on:
+      - superset
+
+  # ──────────────────────────────────────────────────────────
+  # ETL Worker — Python + APScheduler
+  # ──────────────────────────────────────────────────────────
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile.etl
+    container_name: pharma_etl
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 6432
+      POSTGRES_DB: ${POSTGRES_DB:-pharma_dr}
+      POSTGRES_USER: ${POSTGRES_USER:-pharma_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SAP_HANA_HOST: ${SAP_HANA_HOST:-}
+      SAP_HANA_PORT: ${SAP_HANA_PORT:-30015}
+      SAP_HANA_USER: ${SAP_HANA_USER:-}
+      SAP_HANA_PASSWORD: ${SAP_HANA_PASSWORD:-}
+      SQLSRV_HOST: ${SQLSRV_HOST:-}
+      SQLSRV_PORT: ${SQLSRV_PORT:-1433}
+      SQLSRV_DB: ${SQLSRV_DB:-}
+      SQLSRV_USER: ${SQLSRV_USER:-}
+      SQLSRV_PASSWORD: ${SQLSRV_PASSWORD:-}
+      EXCEL_LANDING_PATH: /app/data/excel_samples
+      EXCEL_PROCESSED_PATH: /app/data/excel_processed
+      EXCEL_REJECTED_PATH: /app/data/excel_rejected
+      ETL_LOG_LEVEL: ${ETL_LOG_LEVEL:-INFO}
+      ETL_LOG_PATH: /app/data/logs
+      ETL_WATERMARK_PATH: /app/data/watermarks
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      - etl-data:/app/data
+      - ./data:/app/data/source:ro
+      - ./etl:/app/etl:ro
+    networks:
+      - pharma-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+
+  # ──────────────────────────────────────────────────────────
+  # Nginx — Reverse Proxy + SSL Termination
+  # ──────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: pharma_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./scripts/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-certs:/etc/nginx/certs
+    networks:
+      - pharma-public
+      - pharma-internal
+    depends_on:
+      - superset

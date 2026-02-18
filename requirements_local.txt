@@ -1,0 +1,36 @@
+# ============================================================
+# Pharma DR · Local Run Requirements (No Docker)
+# DuckDB + Streamlit stack — no PostgreSQL, no Redis needed
+# Python 3.12+
+# Install: pip install -r requirements_local.txt
+# ============================================================
+
+# Core analytics engine (no server required)
+duckdb==1.2.2
+
+# Data wrangling
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==18.1.0
+
+# BI Dashboard
+streamlit==1.42.2
+plotly==5.24.1
+streamlit-extras==0.5.0
+
+# Excel processing (6 distributor formats)
+openpyxl==3.1.5
+xlrd==2.0.1
+
+# Data cleaning / fuzzy matching
+rapidfuzz==3.10.1
+unidecode==1.3.8
+
+# Synthetic data generation
+faker==33.1.0
+
+# Utilities
+python-dotenv==1.0.1
+loguru==0.7.3
+rich==13.9.4
+tqdm==4.67.1
