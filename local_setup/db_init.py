@@ -1,4 +1,4 @@
-﻿"""
+"""
 Pharma DR · DuckDB Database Initializer
 ========================================
 Creates the full star-schema warehouse inside a single DuckDB file.
@@ -304,10 +304,60 @@ def init_db():
         )
     """)
 
+    # ── Budget Fact ──────────────────────────────────────────────
+    con.execute("""
+        CREATE TABLE fact_budget (
+            budget_key      INTEGER PRIMARY KEY,
+            year_month      VARCHAR(7)  NOT NULL,
+            year            INTEGER     NOT NULL,
+            month_num       INTEGER     NOT NULL,
+            zone_key        INTEGER REFERENCES dim_zone(zone_key),
+            salesperson_key INTEGER REFERENCES dim_salesperson(salesperson_key),
+            category        VARCHAR(50) NOT NULL,
+            budget_amount   DOUBLE      NOT NULL DEFAULT 0
+        )
+    """)
+
+    # ── Validation Queue ─────────────────────────────────────────
+    con.execute("""
+        CREATE TABLE validation_queue (
+            id                 INTEGER PRIMARY KEY,
+            entry_type         VARCHAR(20)  NOT NULL,
+            raw_value          VARCHAR(200) NOT NULL,
+            suggested_value    VARCHAR(200),
+            mapped_key         INTEGER,
+            confidence_pct     DOUBLE,
+            source_distributor VARCHAR(50),
+            source_file        VARCHAR(200),
+            status             VARCHAR(20)  DEFAULT 'PENDIENTE',
+            created_at         TIMESTAMP,
+            resolved_at        TIMESTAMP,
+            resolved_by        VARCHAR(100)
+        )
+    """)
+
+    # ── ETL Run Log ──────────────────────────────────────────────
+    con.execute("""
+        CREATE TABLE etl_run_log (
+            run_id           INTEGER PRIMARY KEY,
+            run_type         VARCHAR(40) NOT NULL,
+            source_system    VARCHAR(50),
+            started_at       TIMESTAMP   NOT NULL,
+            finished_at      TIMESTAMP,
+            duration_sec     DOUBLE,
+            status           VARCHAR(20),
+            records_read     INTEGER DEFAULT 0,
+            records_loaded   INTEGER DEFAULT 0,
+            records_rejected INTEGER DEFAULT 0,
+            error_message    VARCHAR(500)
+        )
+    """)
+
     con.close()
     print("[OK] Schema created: dim_zone, dim_city, dim_laboratory, dim_product")
     print("[OK] Schema created: dim_distributor, dim_salesperson, dim_client")
     print("[OK] Schema created: fact_sales, fact_commission")
+    print("[OK] Schema created: fact_budget, validation_queue, etl_run_log")
     print("\nDone! Database ready at:", DB_PATH)
 
 

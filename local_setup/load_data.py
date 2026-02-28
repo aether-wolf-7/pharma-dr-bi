@@ -11,7 +11,7 @@ import sys
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -267,6 +267,154 @@ def compute_commissions(con):
     return rows
 
 
+def generate_budget():
+    """Monthly budget by zone / salesperson / category (2021-2024)."""
+    ZONE_STRETCH = {1: 1.06, 2: 1.14, 3: 0.98, 4: 1.28, 5: 1.18}
+    YOY = {2021: 1.00, 2022: 1.05, 2023: 1.10, 2024: 1.16}
+    SP_BASE = {
+        1: 850000, 2: 820000, 3: 900000, 4: 750000,
+        5: 800000, 6: 780000, 7: 950000, 8: 720000,
+        9: 820000, 10: 780000, 11: 760000,
+        12: 760000, 13: 720000, 14: 700000, 15: 800000,
+    }
+    SP_ZONE = {1:1,2:1,3:1,4:1,5:2,6:2,7:2,8:2,9:3,10:3,11:3,12:4,13:4,14:4,15:5}
+    CAT_W = {
+        'ANTIBIOTICO':0.18,'ANALGESICO':0.15,'VITAMINAS':0.12,
+        'CARDIOVASCULAR':0.14,'DIABETES':0.10,'RESPIRATORIO':0.10,
+        'GASTRO':0.08,'DERMATOLOGIA':0.05,'ANTIPARASITARIO':0.03,
+        'CORTICOIDE':0.02,'HORMONA':0.02,'PSIQUIATRIA':0.01,
+    }
+    rows = []
+    bk = 1
+    for year in range(2021, 2025):
+        for month in range(1, 13):
+            ym = f"{year}-{month:02d}"
+            for sp_key, base in SP_BASE.items():
+                zone_key = SP_ZONE[sp_key]
+                sp_budget = (
+                    base
+                    * SEASONAL[month]
+                    * YOY.get(year, 1.0)
+                    * ZONE_STRETCH[zone_key]
+                    * random.uniform(0.97, 1.03)
+                )
+                for cat, w in CAT_W.items():
+                    rows.append((bk, ym, year, month, zone_key, sp_key, cat, round(sp_budget * w, 2)))
+                    bk += 1
+    return rows
+
+
+_VQ_ITEMS = [
+    ('PRODUCTO', 'Amoxicilina 500 caps',     'Amoxicilina 500mg Capsulas',       1,  94.5, 'DIST_A', None),
+    ('PRODUCTO', 'Cipro 500mg tab',           'Ciprofloxacino 500mg Tabletas',    2,  87.3, 'DIST_B', None),
+    ('PRODUCTO', 'Azitro 500 comp',           'Azitromicina 500mg Tabletas',      3,  91.2, 'DIST_C', None),
+    ('PRODUCTO', 'Ibuprofeno 400',            'Ibuprofeno 400mg Tabletas',        7,  95.8, 'DIST_A', None),
+    ('PRODUCTO', 'Paracetamol 500 comp',      'Paracetamol 500mg Tabletas',       8,  98.1, 'DIST_D', None),
+    ('CIUDAD',   'Sto. Domingo',              'Santo Domingo',                    1,  96.8, 'DIST_A', None),
+    ('CIUDAD',   'Sgo. de los Caballeros',    'Santiago',                         6,  88.4, 'DIST_B', None),
+    ('CIUDAD',   'Pto. Plata',                'Puerto Plata',                     9,  91.3, 'DIST_E', None),
+    ('PRODUCTO', 'Atorva 20mg',               'Atorvastatina 20mg Tabletas',      18, 85.6, 'DIST_F', None),
+    ('CIUDAD',   'S. Cristobal',              'San Cristobal',                    20, 87.2, 'DIST_F', None),
+    ('PRODUCTO', 'Metformin 850 mg',          'Metformina 850mg Tabletas',        25, 88.7, 'DIST_B', None),
+    ('CIUDAD',   'SPM',                       'San Pedro de Macoris',             15, 79.6, 'DIST_D', None),
+    ('PRODUCTO', 'Omeprazol 20mg caps',       'Omeprazol 20mg Capsulas',          34, 96.3, 'DIST_A', ('APROBADO',  7, 'Admin')),
+    ('PRODUCTO', 'Losartan 50 tab',           'Losartan 50mg Tabletas',           19, 92.4, 'DIST_E', ('APROBADO',  5, 'Admin')),
+    ('PRODUCTO', 'Vitamina C 500',            'Vitamina C 500mg Tabletas',        12, 97.8, 'DIST_A', ('APROBADO',  3, 'Admin')),
+    ('CIUDAD',   'La Romana RD',              'La Romana',                        14, 92.1, 'DIST_C', ('APROBADO',  6, 'Admin')),
+    ('PRODUCTO', 'Salbutamol Inhal 100mcg',   'Salbutamol 100mcg Inhalador',      29, 89.2, 'DIST_C', ('APROBADO', 10, 'Admin')),
+    ('PRODUCTO', 'Diclofenac 50mg tab',       'Diclofenaco 50mg Tabletas',         9, 93.1, 'DIST_B', ('APROBADO',  2, 'Admin')),
+    ('CIUDAD',   'Sto. Domingo Este',         'Santo Domingo Este',                2, 94.5, 'DIST_A', ('APROBADO',  1, 'Admin')),
+    ('PRODUCTO', 'Furosemida 40mg tab',       'Furosemida 40mg Tabletas',         24, 96.0, 'DIST_B', ('APROBADO',  8, 'Admin')),
+    ('PRODUCTO', 'Pantoprazol 40mg tab',      'Pantoprazol 40mg Tabletas',        38, 97.5, 'DIST_F', ('APROBADO', 12, 'Admin')),
+    ('PRODUCTO', 'Complejo Vitaminico Extra', None,                               None, 42.1, 'DIST_D', ('RECHAZADO',  4, 'Admin')),
+    ('CIUDAD',   'Zona Franca La Romana',     None,                               None, 35.8, 'DIST_C', ('RECHAZADO',  9, 'Admin')),
+    ('PRODUCTO', 'Suplemento Omega-3 1000',   None,                               None, 38.4, 'DIST_B', ('RECHAZADO', 11, 'Admin')),
+]
+
+
+def generate_validation_queue():
+    now = datetime.now()
+    rows = []
+    for i, item in enumerate(_VQ_ITEMS, 1):
+        etype, raw_val, suggested, mapped_key, conf, src_dist, resolution = item
+        created = now - timedelta(days=random.randint(2, 28), hours=random.randint(0, 23))
+        src_file = f"{src_dist}_import_{created.strftime('%Y%m%d')}.xlsx"
+        if resolution is None:
+            status, resolved_at, resolver = 'PENDIENTE', None, None
+        else:
+            status, days_ago, resolver = resolution
+            resolved_at = now - timedelta(days=days_ago, hours=random.randint(0, 8))
+        rows.append((i, etype, raw_val, suggested, mapped_key, conf,
+                     src_dist, src_file, status, created, resolved_at, resolver))
+    return rows
+
+
+def generate_etl_log():
+    now = datetime.now()
+    rows = []
+    run_id = 1
+
+    # SAP HANA incremental — 1-3 runs/day for last 60 days
+    for day in range(60, 0, -1):
+        base = now - timedelta(days=day)
+        for _ in range(random.randint(1, 3)):
+            started = base.replace(hour=random.randint(6, 22), minute=random.randint(0, 59),
+                                   second=0, microsecond=0)
+            dur = random.uniform(8, 35)
+            rnd = random.random()
+            status = 'SUCCESS' if rnd > 0.06 else ('WARNING' if rnd > 0.02 else 'ERROR')
+            r_read = random.randint(150, 850)
+            r_load = r_read if status == 'SUCCESS' else int(r_read * random.uniform(0.70, 0.95))
+            err = (None if status == 'SUCCESS'
+                   else ('Registros con producto no homologado' if status == 'WARNING'
+                         else 'Timeout conexion SAP HANA'))
+            rows.append((run_id, 'SAP_HANA_INC', 'SAP_HANA', started,
+                         started + timedelta(seconds=dur), round(dur, 1),
+                         status, r_read, r_load, r_read - r_load, err))
+            run_id += 1
+
+    # Excel distributors — daily for last 30 days
+    dist_freq = {'DIST_A':0.90,'DIST_B':0.60,'DIST_C':0.90,
+                 'DIST_D':0.60,'DIST_E':0.40,'DIST_F':0.60}
+    for day in range(30, 0, -1):
+        base = now - timedelta(days=day)
+        for dist_code, freq in dist_freq.items():
+            if random.random() < freq:
+                started = base.replace(hour=random.randint(7, 18), minute=random.randint(0, 59),
+                                       second=0, microsecond=0)
+                dur = random.uniform(15, 120)
+                rnd = random.random()
+                status = 'SUCCESS' if rnd > 0.09 else ('WARNING' if rnd > 0.04 else 'ERROR')
+                r_read = random.randint(50, 500)
+                r_load = r_read if status == 'SUCCESS' else int(r_read * random.uniform(0.60, 0.90))
+                rej = r_read - r_load
+                err = (None if status == 'SUCCESS'
+                       else ('Columna no encontrada en archivo' if status == 'ERROR'
+                             else f'{rej} ciudades sin homologar'))
+                rows.append((run_id, f'EXCEL_{dist_code}', dist_code, started,
+                             started + timedelta(seconds=dur), round(dur, 1),
+                             status, r_read, r_load, rej, err))
+                run_id += 1
+
+    # Monthly: SQL Server + Commission (last 2 months)
+    for m in [1, 2]:
+        ref = (now.replace(day=1) - timedelta(days=30 * m)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        for rtype, rsys, base_h, dur_lo, dur_hi in [
+            ('SQL_SERVER_DELTA', 'SQL_SERVER',  7, 180, 420),
+            ('COMMISSION_CALC',  'DW_INTERNAL', 8,  45, 120),
+        ]:
+            started = ref.replace(hour=base_h)
+            dur = random.uniform(dur_lo, dur_hi)
+            r_read = random.randint(800, 2000) if rtype == 'SQL_SERVER_DELTA' else 180
+            rows.append((run_id, rtype, rsys, started,
+                         started + timedelta(seconds=dur), round(dur, 1),
+                         'SUCCESS', r_read, r_read, 0, None))
+            run_id += 1
+
+    return rows
+
+
 def main():
     print("=" * 55)
     print("Pharma DR · Data Generator & DuckDB Loader")
@@ -322,7 +470,7 @@ def main():
     print(f"  [OK] Total Net Sales: RD$ {total_net:,.0f}")
 
     # ── Commissions ──────────────────────────────────────────
-    print("\n[3/3] Computing monthly commissions...")
+    print("\n[3/5] Computing monthly commissions...")
     comm_rows = compute_commissions(con)
     comm_df = pd.DataFrame(comm_rows, columns=[
         "commission_key","year_month","salesperson_key","zone_key",
@@ -338,6 +486,44 @@ def main():
     con.execute("INSERT INTO fact_commission SELECT * FROM comm_df_view")
     con.unregister("comm_df_view")
     print(f"  [OK] {len(comm_rows)} commission rows computed")
+
+    # ── Budget ───────────────────────────────────────────────
+    print("\n[4/5] Generating budget data (2021-2024)...")
+    budget_rows = generate_budget()
+    budget_df = pd.DataFrame(budget_rows, columns=[
+        "budget_key","year_month","year","month_num",
+        "zone_key","salesperson_key","category","budget_amount",
+    ])
+    for col in ["budget_key","year","month_num","zone_key","salesperson_key"]:
+        budget_df[col] = budget_df[col].astype(int)
+    budget_df["budget_amount"] = budget_df["budget_amount"].astype(float)
+    con.register("budget_df_view", budget_df)
+    con.execute("INSERT INTO fact_budget SELECT * FROM budget_df_view")
+    con.unregister("budget_df_view")
+    print(f"  [OK] {len(budget_rows):,} budget rows loaded")
+
+    # ── Validation Queue & ETL Log ───────────────────────────
+    print("\n[5/5] Generating validation queue and ETL run log...")
+    vq_rows = generate_validation_queue()
+    vq_df = pd.DataFrame(vq_rows, columns=[
+        "id","entry_type","raw_value","suggested_value","mapped_key","confidence_pct",
+        "source_distributor","source_file","status","created_at","resolved_at","resolved_by",
+    ])
+    con.register("vq_df_view", vq_df)
+    con.execute("INSERT INTO validation_queue SELECT * FROM vq_df_view")
+    con.unregister("vq_df_view")
+
+    etl_rows = generate_etl_log()
+    etl_df = pd.DataFrame(etl_rows, columns=[
+        "run_id","run_type","source_system","started_at","finished_at",
+        "duration_sec","status","records_read","records_loaded","records_rejected","error_message",
+    ])
+    for col in ["run_id","records_read","records_loaded","records_rejected"]:
+        etl_df[col] = etl_df[col].astype(int)
+    con.register("etl_df_view", etl_df)
+    con.execute("INSERT INTO etl_run_log SELECT * FROM etl_df_view")
+    con.unregister("etl_df_view")
+    print(f"  [OK] {len(vq_rows)} validation items | {len(etl_rows)} ETL run entries")
 
     # Summary
     print("\n" + "=" * 55)

@@ -49,13 +49,18 @@ def get_conn():
     if not DB_PATH.exists():
         st.error(f"Database not found: {DB_PATH}\n\nRun: python local_setup/db_init.py && python local_setup/load_data.py")
         st.stop()
-    return duckdb.connect(str(DB_PATH), read_only=True)
+    return duckdb.connect(str(DB_PATH))
 
 @st.cache_data(ttl=300)
 def q(sql: str) -> pd.DataFrame:
     """Execute a SQL query and return a DataFrame (cached 5 min)."""
     con = get_conn()
     return con.execute(sql).df()
+
+def db_write(sql: str):
+    """Execute a write query and invalidate the read cache."""
+    get_conn().execute(sql)
+    st.cache_data.clear()
 
 # ── Sidebar Navigation ────────────────────────────────────────
 DASHBOARDS = {
@@ -74,13 +79,18 @@ DASHBOARDS = {
     "🗂️  Ventas por Categoría":    "categoria",
     "🏆 Ranking Vendedores":       "vendedores",
     "🎯 Cumplimiento de Metas":    "metas",
+    "─────────────────────────":  "sep",
+    "📋 Presupuesto vs Ventas":   "presupuesto",
+    "🔍 Validación Interactiva":  "validacion",
+    "⚙️  Control de Cargas ETL":   "etl_monitor",
 }
 
 with st.sidebar:
     st.markdown("## 💊 Pharma DR")
     st.markdown("### República Dominicana")
     st.markdown("---")
-    selected = st.radio("Dashboards", list(DASHBOARDS.keys()), label_visibility="collapsed")
+    _nav_keys = [k for k in DASHBOARDS if DASHBOARDS[k] != "sep"]
+    selected = st.radio("Dashboards", _nav_keys, label_visibility="collapsed")
     dashboard = DASHBOARDS[selected]
     st.markdown("---")
 
@@ -1055,13 +1065,391 @@ elif dashboard == "metas":
         fig2.update_layout(height=280, margin=dict(t=10,b=40))
         st.plotly_chart(fig2, use_container_width=True)
 
+
+# ════════════════════════════════════════════════════════════════
+# DASHBOARD 15: PRESUPUESTO VS VENTAS
+# ════════════════════════════════════════════════════════════════
+elif dashboard == "presupuesto":
+    st.title("📋 Presupuesto vs Ventas")
+
+    y_csv   = ",".join(str(y) for y in year_filter) or "0"
+    zones_q = "','".join(zone_filter)
+    cats_q  = "','".join(cat_filter)
+
+    bgt_m = q(f"""
+        SELECT b.year_month, ROUND(SUM(b.budget_amount), 0) AS budget
+        FROM fact_budget b JOIN dim_zone z ON z.zone_key = b.zone_key
+        WHERE b.year IN ({y_csv}) AND z.zone_name IN ('{zones_q}') AND b.category IN ('{cats_q}')
+        GROUP BY b.year_month ORDER BY b.year_month
+    """)
+    act_m = q(f"""
+        SELECT s.year_month, ROUND(SUM(s.net_amount), 0) AS actual
+        FROM fact_sales s
+        JOIN dim_zone z ON z.zone_key = s.zone_key
+        JOIN dim_product p ON p.product_key = s.product_key
+        JOIN dim_distributor d ON d.distributor_key = s.distributor_key
+        WHERE {where_clause()}
+        GROUP BY s.year_month ORDER BY s.year_month
+    """)
+    bva = bgt_m.merge(act_m, on="year_month", how="left").fillna({"actual": 0.0})
+    bva["achievement_pct"] = (bva["actual"] / bva["budget"].replace(0, float("nan")) * 100).fillna(0).round(1)
+    bva["variance"] = (bva["actual"] - bva["budget"]).round(0)
+
+    total_bgt = bva["budget"].sum()
+    total_act = bva["actual"].sum()
+    ach_total = (total_act / total_bgt * 100) if total_bgt else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("🎯 Presupuesto Total", fmt_rd(total_bgt))
+    c2.metric("💵 Ventas Reales",     fmt_rd(total_act))
+    c3.metric("📊 Logro General",     f"{ach_total:.1f}%",
+              delta=f"{ach_total-100:+.1f}% vs meta", delta_color="normal")
+    c4.metric("📉 Varianza",          fmt_rd(total_act - total_bgt), delta_color="normal")
+    st.markdown("---")
+
+    col_l, col_r = st.columns([3, 2])
+    with col_l:
+        st.subheader("Presupuesto vs Ventas por Mes")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=bva["year_month"], y=bva["budget"],
+                             name="Presupuesto", marker_color="#95A5A6"))
+        fig.add_trace(go.Bar(x=bva["year_month"], y=bva["actual"],
+                             name="Ventas Reales", marker_color="#2ECC71"))
+        fig.update_layout(barmode="group", template="plotly_white",
+                          height=360, margin=dict(t=10, b=40),
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_r:
+        st.subheader("Logro % por Mes")
+        ach_colors = ["#2ECC71" if v >= 100 else "#F39C12" if v >= 85 else "#E74C3C"
+                      for v in bva["achievement_pct"]]
+        fig2 = go.Figure(go.Bar(
+            x=bva["year_month"], y=bva["achievement_pct"],
+            marker_color=ach_colors,
+            text=[f"{v:.0f}%" for v in bva["achievement_pct"]], textposition="outside",
+        ))
+        fig2.add_hline(y=100, line_dash="dash", line_color="navy", annotation_text="Meta 100%")
+        fig2.add_hline(y=85,  line_dash="dot",  line_color="orange", annotation_text="Min 85%")
+        fig2.update_layout(template="plotly_white", height=360,
+                           margin=dict(t=10, b=40), yaxis_title="Logro %")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    bgt_z = q(f"""
+        SELECT z.zone_name, ROUND(SUM(b.budget_amount), 0) AS budget
+        FROM fact_budget b JOIN dim_zone z ON z.zone_key = b.zone_key
+        WHERE b.year IN ({y_csv}) AND z.zone_name IN ('{zones_q}') AND b.category IN ('{cats_q}')
+        GROUP BY z.zone_name
+    """)
+    act_z = q(f"""
+        SELECT z.zone_name, ROUND(SUM(s.net_amount), 0) AS actual
+        FROM fact_sales s
+        JOIN dim_zone z ON z.zone_key = s.zone_key
+        JOIN dim_product p ON p.product_key = s.product_key
+        JOIN dim_distributor d ON d.distributor_key = s.distributor_key
+        WHERE {where_clause()}
+        GROUP BY z.zone_name
+    """)
+    zone_bva = bgt_z.merge(act_z, on="zone_name", how="left").fillna({"actual": 0.0})
+    zone_bva["achievement_pct"] = (
+        zone_bva["actual"] / zone_bva["budget"].replace(0, float("nan")) * 100
+    ).fillna(0).round(1)
+    zone_bva["variance"] = (zone_bva["actual"] - zone_bva["budget"]).round(0)
+    zone_bva = zone_bva.sort_values("achievement_pct")
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.subheader("Logro por Zona")
+        z_colors = ["#2ECC71" if v >= 100 else "#F39C12" if v >= 85 else "#E74C3C"
+                    for v in zone_bva["achievement_pct"]]
+        fig3 = go.Figure()
+        for i, (_, row) in enumerate(zone_bva.iterrows()):
+            fig3.add_trace(go.Bar(
+                x=[row.achievement_pct], y=[row.zone_name], orientation="h",
+                marker_color=z_colors[i], showlegend=False,
+                text=f"{row.achievement_pct:.1f}%", textposition="outside",
+            ))
+        fig3.add_vline(x=100, line_dash="dash", line_color="navy", annotation_text="100%")
+        fig3.add_vline(x=85,  line_dash="dot",  line_color="orange")
+        fig3.update_layout(template="plotly_white", height=280,
+                           margin=dict(t=10, b=10), xaxis_title="Logro %", yaxis_title="")
+        st.plotly_chart(fig3, use_container_width=True)
+
+    with col4:
+        st.subheader("Resumen por Zona")
+        tbl_z = zone_bva[["zone_name","budget","actual","achievement_pct","variance"]].copy()
+        tbl_z.columns = ["Zona","Presupuesto","Ventas","Logro %","Varianza"]
+        for col_name in ["Presupuesto","Ventas","Varianza"]:
+            tbl_z[col_name] = tbl_z[col_name].apply(lambda x: f"RD$ {x:,.0f}")
+        tbl_z["Logro %"] = tbl_z["Logro %"].apply(lambda x: f"{x:.1f}%")
+        st.dataframe(tbl_z.sort_values("Logro %", ascending=False),
+                     use_container_width=True, hide_index=True)
+
+    st.subheader("Presupuesto vs Ventas por Categoria Terapeutica")
+    bgt_cat = q(f"""
+        SELECT b.category, ROUND(SUM(b.budget_amount), 0) AS budget
+        FROM fact_budget b JOIN dim_zone z ON z.zone_key = b.zone_key
+        WHERE b.year IN ({y_csv}) AND z.zone_name IN ('{zones_q}') AND b.category IN ('{cats_q}')
+        GROUP BY b.category ORDER BY budget DESC
+    """)
+    act_cat = q(f"""
+        SELECT p.category, ROUND(SUM(s.net_amount), 0) AS actual
+        FROM fact_sales s
+        JOIN dim_product p ON p.product_key = s.product_key
+        JOIN dim_zone z ON z.zone_key = s.zone_key
+        JOIN dim_distributor d ON d.distributor_key = s.distributor_key
+        WHERE {where_clause()}
+        GROUP BY p.category
+    """)
+    cat_bva = bgt_cat.merge(act_cat, on="category", how="left").fillna({"actual": 0.0})
+    fig5 = go.Figure()
+    fig5.add_trace(go.Bar(x=cat_bva["category"], y=cat_bva["budget"],
+                          name="Presupuesto", marker_color="#95A5A6"))
+    fig5.add_trace(go.Bar(x=cat_bva["category"], y=cat_bva["actual"],
+                          name="Ventas Reales", marker_color="#3498DB"))
+    fig5.update_layout(barmode="group", template="plotly_white", height=300,
+                       margin=dict(t=10, b=60),
+                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig5, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════
+# DASHBOARD 16: VALIDACION INTERACTIVA
+# ════════════════════════════════════════════════════════════════
+elif dashboard == "validacion":
+    st.title("🔍 Validacion Interactiva de Datos")
+    st.markdown(
+        "Resuelve inconsistencias detectadas por el pipeline ETL "
+        "antes de que ingresen al Data Warehouse."
+    )
+
+    stats = q("SELECT status, COUNT(*) AS cnt FROM validation_queue GROUP BY status")
+    s_map      = dict(zip(stats["status"], stats["cnt"]))
+    pending_n  = int(s_map.get("PENDIENTE",  0))
+    approved_n = int(s_map.get("APROBADO",   0))
+    rejected_n = int(s_map.get("RECHAZADO",  0))
+    approval_rt = (approved_n / (approved_n + rejected_n) * 100) if (approved_n + rejected_n) > 0 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pendientes",           f"{pending_n}",  delta="Requieren accion", delta_color="off")
+    c2.metric("Aprobados",            f"{approved_n}")
+    c3.metric("Rechazados",           f"{rejected_n}")
+    c4.metric("Tasa de Aprobacion",   f"{approval_rt:.0f}%")
+    st.markdown("---")
+
+    tab_p, tab_h = st.tabs([
+        f"Pendientes ({pending_n})",
+        f"Historial ({approved_n + rejected_n})"
+    ])
+
+    with tab_p:
+        pending_df = q("""
+            SELECT id, entry_type, raw_value, suggested_value,
+                   confidence_pct, source_distributor, source_file, created_at
+            FROM validation_queue WHERE status='PENDIENTE'
+            ORDER BY confidence_pct DESC
+        """)
+        if pending_df.empty:
+            st.success("No hay elementos pendientes. El pipeline esta limpio.")
+        else:
+            st.markdown(
+                f"**{len(pending_df)} elementos esperan resolucion.** "
+                "Los de mayor confianza se muestran primero."
+            )
+            st.markdown("---")
+            hdr = st.columns([1, 2.5, 2.5, 1.2, 1.5, 1, 1])
+            for hcol, lbl in zip(hdr, ["Tipo","Valor Original","Sugerencia",
+                                        "Confianza","Distribuidor","",""]):
+                hcol.markdown(f"**{lbl}**")
+            st.markdown("---")
+
+            for _, row in pending_df.iterrows():
+                cols = st.columns([1, 2.5, 2.5, 1.2, 1.5, 1, 1])
+                badge_bg = "#3498DB" if row.entry_type == "CIUDAD" else "#8E44AD"
+                cols[0].markdown(
+                    f"<span style='background:{badge_bg};color:white;"
+                    f"padding:2px 8px;border-radius:4px;font-size:0.78rem'>"
+                    f"{row.entry_type}</span>",
+                    unsafe_allow_html=True,
+                )
+                cols[1].markdown(f"**{row.raw_value}**")
+                sugg = row.suggested_value if pd.notna(row.suggested_value) else None
+                cols[2].markdown(f"→ {sugg}" if sugg else "*Sin sugerencia*")
+                conf = float(row.confidence_pct) if pd.notna(row.confidence_pct) else 0.0
+                conf_bg = "#2ECC71" if conf >= 90 else "#F39C12" if conf >= 75 else "#E74C3C"
+                cols[3].markdown(
+                    f"<span style='background:{conf_bg};color:white;"
+                    f"padding:2px 8px;border-radius:4px;font-size:0.82rem'>"
+                    f"{conf:.1f}%</span>",
+                    unsafe_allow_html=True,
+                )
+                cols[4].markdown(row.source_distributor)
+                if cols[5].button("Aprobar", key=f"app_{row.id}",
+                                  help="Confirmar sugerencia y cargar al DW"):
+                    db_write(
+                        f"UPDATE validation_queue "
+                        f"SET status='APROBADO', resolved_at=CURRENT_TIMESTAMP, "
+                        f"resolved_by='Usuario' WHERE id={int(row.id)}"
+                    )
+                    st.rerun()
+                if cols[6].button("Rechazar", key=f"rej_{row.id}",
+                                  help="Descartar — no homologar"):
+                    db_write(
+                        f"UPDATE validation_queue "
+                        f"SET status='RECHAZADO', resolved_at=CURRENT_TIMESTAMP, "
+                        f"resolved_by='Usuario' WHERE id={int(row.id)}"
+                    )
+                    st.rerun()
+                st.markdown(
+                    "<hr style='margin:4px 0;opacity:0.15'>",
+                    unsafe_allow_html=True,
+                )
+
+    with tab_h:
+        hist_df = q("""
+            SELECT entry_type, raw_value, suggested_value, confidence_pct,
+                   source_distributor, status, resolved_at, resolved_by
+            FROM validation_queue WHERE status != 'PENDIENTE'
+            ORDER BY resolved_at DESC
+        """)
+        if hist_df.empty:
+            st.info("Aun no hay elementos resueltos.")
+        else:
+            col_l2, col_r2 = st.columns([1, 2])
+            with col_l2:
+                pie_d = hist_df.groupby("status").size().reset_index(name="cnt")
+                fp = px.pie(
+                    pie_d, values="cnt", names="status", hole=0.5,
+                    color="status",
+                    color_discrete_map={"APROBADO":"#2ECC71","RECHAZADO":"#E74C3C"},
+                    template="plotly_white",
+                )
+                fp.update_layout(height=220, margin=dict(t=10, b=10))
+                st.plotly_chart(fp, use_container_width=True)
+            with col_r2:
+                ds = (hist_df.groupby(["source_distributor","status"])
+                      .size().reset_index(name="cnt"))
+                fb = px.bar(
+                    ds, x="source_distributor", y="cnt", color="status",
+                    color_discrete_map={"APROBADO":"#2ECC71","RECHAZADO":"#E74C3C"},
+                    template="plotly_white", barmode="stack",
+                    labels={"source_distributor":"Distribuidor",
+                            "cnt":"Elementos","status":"Estado"},
+                )
+                fb.update_layout(height=220, margin=dict(t=10, b=10),
+                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                st.plotly_chart(fb, use_container_width=True)
+
+            tbl_h = hist_df[["entry_type","raw_value","suggested_value","confidence_pct",
+                             "source_distributor","status","resolved_at","resolved_by"]].copy()
+            tbl_h.columns = ["Tipo","Valor Original","Sugerencia","Confianza %",
+                             "Distribuidor","Estado","Resuelto","Por"]
+            tbl_h["Confianza %"] = tbl_h["Confianza %"].apply(
+                lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+            )
+            tbl_h["Resuelto"] = pd.to_datetime(tbl_h["Resuelto"]).dt.strftime("%Y-%m-%d %H:%M")
+            st.dataframe(tbl_h, use_container_width=True, hide_index=True)
+
+
+# ════════════════════════════════════════════════════════════════
+# DASHBOARD 17: CONTROL DE CARGAS ETL
+# ════════════════════════════════════════════════════════════════
+elif dashboard == "etl_monitor":
+    st.title("⚙️ Control de Cargas ETL")
+    st.markdown("Monitoreo del pipeline: ejecuciones, tasas de exito y registros procesados.")
+
+    all_runs = q("""
+        SELECT run_id, run_type, source_system, started_at, finished_at,
+               duration_sec, status,
+               records_read, records_loaded, records_rejected, error_message,
+               CAST(started_at AS DATE) AS run_date
+        FROM etl_run_log ORDER BY started_at DESC
+    """)
+
+    max_date   = all_runs["run_date"].max()
+    today_runs = all_runs[all_runs["run_date"] == max_date]
+    success_rt = (all_runs["status"] == "SUCCESS").mean() * 100
+    error_ct   = int((all_runs["status"] == "ERROR").sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ejecuciones Hoy",  f"{len(today_runs)}")
+    c2.metric("Tasa de Exito",    f"{success_rt:.1f}%")
+    c3.metric("Registros Hoy",    f"{int(today_runs['records_loaded'].sum()):,}")
+    c4.metric("Errores (total)",  f"{error_ct}", delta_color="inverse")
+    st.markdown("---")
+
+    STATUS_COLORS = {"SUCCESS":"#2ECC71","WARNING":"#F39C12","ERROR":"#E74C3C"}
+
+    col_l, col_r = st.columns([3, 2])
+    with col_l:
+        st.subheader("Ejecuciones por Dia — ultimos 30 dias")
+        daily = all_runs.copy()
+        daily["run_date"] = pd.to_datetime(daily["run_date"])
+        ds30 = daily.groupby(["run_date","status"]).size().reset_index(name="cnt")
+        dp30 = ds30.pivot(index="run_date", columns="status", values="cnt").fillna(0).reset_index()
+        fig_tl = go.Figure()
+        for sc in ["SUCCESS","WARNING","ERROR"]:
+            if sc in dp30.columns:
+                fig_tl.add_trace(go.Bar(x=dp30["run_date"], y=dp30[sc],
+                                        name=sc, marker_color=STATUS_COLORS[sc]))
+        fig_tl.update_layout(
+            barmode="stack", template="plotly_white",
+            height=320, margin=dict(t=10, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_tl, use_container_width=True)
+
+    with col_r:
+        st.subheader("Estado por Sistema Fuente")
+        sys_s = (all_runs.groupby(["source_system","status"])
+                 .size().reset_index(name="cnt"))
+        fig_ss = px.bar(
+            sys_s, x="cnt", y="source_system", color="status",
+            orientation="h", barmode="stack",
+            color_discrete_map=STATUS_COLORS, template="plotly_white",
+            labels={"cnt":"Ejecuciones","source_system":"Sistema","status":"Estado"},
+        )
+        fig_ss.update_layout(
+            height=320, margin=dict(t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_ss, use_container_width=True)
+
+    st.subheader("Registros Procesados por Dia")
+    rec_d = (all_runs.groupby("run_date")[["records_loaded","records_rejected"]]
+             .sum().reset_index().sort_values("run_date"))
+    rec_d["run_date"] = pd.to_datetime(rec_d["run_date"])
+    fig_rc = go.Figure()
+    fig_rc.add_trace(go.Bar(x=rec_d["run_date"], y=rec_d["records_loaded"],
+                            name="Cargados",   marker_color="#2ECC71"))
+    fig_rc.add_trace(go.Bar(x=rec_d["run_date"], y=rec_d["records_rejected"],
+                            name="Rechazados", marker_color="#E74C3C"))
+    fig_rc.update_layout(
+        barmode="stack", template="plotly_white",
+        height=260, margin=dict(t=10, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_rc, use_container_width=True)
+
+    st.subheader("Ultimas 30 Ejecuciones")
+    recent = all_runs.head(30)[[
+        "run_type","source_system","started_at","duration_sec",
+        "status","records_read","records_loaded","records_rejected","error_message",
+    ]].copy()
+    recent["started_at"]   = pd.to_datetime(recent["started_at"]).dt.strftime("%Y-%m-%d %H:%M")
+    recent["duration_sec"] = recent["duration_sec"].apply(lambda x: f"{x:.0f}s")
+    recent.columns = ["Tipo","Sistema","Inicio","Duracion","Estado",
+                      "Leidos","Cargados","Rechazados","Error"]
+    recent["Error"] = recent["Error"].fillna("—")
+    st.dataframe(recent, use_container_width=True, hide_index=True, height=420)
+
+
 # ── Footer ────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
     "<div style='text-align:center; color:#6c757d; font-size:0.8rem;'>"
-    "💊 Pharma DR · Plataforma de Inteligencia Comercial · "
-    "República Dominicana · Powered by DuckDB + Streamlit"
+    "Pharma DR · Plataforma de Inteligencia Comercial · "
+    "Republica Dominicana · Powered by DuckDB + Streamlit"
     "</div>",
     unsafe_allow_html=True,
 )
-
